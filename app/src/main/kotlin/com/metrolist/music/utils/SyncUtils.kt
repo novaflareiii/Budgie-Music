@@ -74,6 +74,11 @@ sealed class SyncOperation {
     data object ClearPodcastData : SyncOperation()
 }
 
+internal fun hasCompleteLikedSongsResponse(
+    fetchedCount: Int,
+    advertisedCount: Int?,
+) = advertisedCount == null || fetchedCount >= advertisedCount
+
 internal fun localSongIndexesAbsentFromRemote(
     localSongIds: List<String>,
     remoteSongIds: List<String>,
@@ -283,12 +288,14 @@ class SyncUtils @Inject constructor(
     private suspend fun <T> withRetry(
         maxRetries: Int = MAX_RETRIES,
         initialDelay: Long = INITIAL_RETRY_DELAY_MS,
-        block: suspend () -> T
-    ): Result<T> {
+        block: suspend () -> Result<T>
+    ): Result<Result<T>> {
         var currentDelay = initialDelay
         repeat(maxRetries) { attempt ->
             try {
-                return Result.success(block())
+                val result = block()
+                result.getOrThrow()
+                return Result.success(result)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -669,15 +676,18 @@ class SyncUtils @Inject constructor(
                     val remoteIds = remoteSongs.map { it.id }.toSet()
                     val localSongs = database.likedSongEntitiesByNameAsc()
                     val advertisedCount = page.playlist.songCountText?.filter { it.isDigit() }?.toIntOrNull()
-                    check(advertisedCount == null || remoteSongs.size >= advertisedCount) {
-                        "Liked-song response was incomplete (${remoteSongs.size}/$advertisedCount)"
+                    val hasCompleteResponse = hasCompleteLikedSongsResponse(remoteSongs.size, advertisedCount)
+                    if (!hasCompleteResponse) {
+                        Timber.w("Liked-song response was incomplete (${remoteSongs.size}/$advertisedCount); preserving unmatched local likes")
                     }
                     val songIdsWithoutArtists = findSongIdsWithoutArtists(remoteIds)
                     val now = LocalDateTime.now()
 
                     database.withTransaction {
-                        localSongs.filterNot { it.id in remoteIds }.forEach { song ->
-                            update(song.localToggleLike())
+                        if (hasCompleteResponse) {
+                            localSongs.filterNot { it.id in remoteIds }.forEach { song ->
+                                update(song.localToggleLike())
+                            }
                         }
 
                         remoteSongs.forEachIndexed { index, song ->
